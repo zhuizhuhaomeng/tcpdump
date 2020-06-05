@@ -134,6 +134,10 @@ The Regents of the University of California.  All rights reserved.\n";
 #define PATH_SEPARATOR	'/'
 #endif
 
+#include <pthread.h>
+#include <dirent.h>
+
+
 /* capabilities convenience library */
 /* If a code depends on HAVE_LIBCAP_NG, it depends also on HAVE_CAP_NG_H.
  * If HAVE_CAP_NG_H is not defined, undefine HAVE_LIBCAP_NG.
@@ -161,6 +165,16 @@ The Regents of the University of California.  All rights reserved.\n";
 #include "print.h"
 
 #include "fptype.h"
+
+typedef struct cache_block_s cache_block_t;
+
+struct cache_block_s {
+	size_t size;
+	u_char *pos;
+	u_char *start;
+	u_char *end;
+	cache_block_t *next;
+};
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -231,9 +245,22 @@ static int timeout = 1000;		/* default timeout = 1000 ms = 1 s */
 static int immediate_mode;
 #endif
 static int count_mode;
-
+static int cache_on_memory;
+static size_t cache_block_cur_count;
+cache_block_t *cache_block_head;
+cache_block_t *cache_block_tail;
+const char *cache_work_dir;
+char *cache_filter_dir;
+char *cache_output_dir;
+pthread_t dump_thread;
+int dump_exit = 0;
+pthread_cond_t dump_cond;
+pthread_mutex_t dump_mutex;
+static int rotate_incr_flag;
+static uint64_t rotate_incr_idx;
 static int infodelay;
 static int infoprint;
+
 
 char *program_name;
 
@@ -241,6 +268,7 @@ char *program_name;
 cap_channel_t *capdns;
 #endif
 
+static void *cache_dump_worker(void *arg);
 /* Forwards */
 static NORETURN void error(FORMAT_STRING(const char *), ...) PRINTFLIKE(1, 2);
 static void warning(FORMAT_STRING(const char *), ...) PRINTFLIKE(1, 2);
@@ -264,6 +292,7 @@ static NORETURN void show_remote_devices_and_exit(void);
 static void print_packet(u_char *, const struct pcap_pkthdr *, const u_char *);
 static void dump_packet_and_trunc(u_char *, const struct pcap_pkthdr *, const u_char *);
 static void dump_packet(u_char *, const struct pcap_pkthdr *, const u_char *);
+static void dump_packet_memory(u_char *user, const struct pcap_pkthdr *h, const u_char *sp);
 static void droproot(const char *, const char *);
 
 #ifdef SIGNAL_REQ_INFO
@@ -702,6 +731,9 @@ show_remote_devices_and_exit(void)
 #define OPTION_TSTAMP_NANO		134
 #define OPTION_FP_TYPE			135
 #define OPTION_COUNT			136
+#define OPTION_CACHE_ON_MEM             137
+#define OPTION_CACHE_WORK_DIR           138
+#define OPTION_ROTATE_INCR              139
 
 static const struct option longopts[] = {
 #if defined(HAVE_PCAP_CREATE) || defined(_WIN32)
@@ -750,6 +782,9 @@ static const struct option longopts[] = {
 	{ "number", no_argument, NULL, '#' },
 	{ "print", no_argument, NULL, OPTION_PRINT },
 	{ "version", no_argument, NULL, OPTION_VERSION },
+	{ "cache-on-memory", no_argument, NULL, OPTION_CACHE_ON_MEM },
+	{ "cache-work-dir", required_argument, NULL, OPTION_CACHE_WORK_DIR },
+	{ "rotate-incr", no_argument, NULL, OPTION_ROTATE_INCR },
 	{ NULL, 0, NULL, 0 }
 };
 
@@ -835,6 +870,17 @@ getWflagChars(int x)
 	return c;
 }
 
+static void
+DeleteOldestFile(char *filename, char *buffer)
+{
+	if (rotate_incr_idx >= Wflag) {
+		if (snprintf(buffer, PATH_MAX + 1, "%s%ld",
+		  filename, rotate_incr_idx - Wflag) > PATH_MAX)
+			error("too many output files or filename is too long (> %d)", PATH_MAX);
+
+		unlink(buffer);
+	}
+}
 
 static void
 MakeFilename(char *buffer, char *orig_name, int cnt, int max_chars)
@@ -861,11 +907,23 @@ MakeFilename(char *buffer, char *orig_name, int cnt, int max_chars)
         }
 
 	if (cnt == 0 && max_chars == 0)
-		strncpy(buffer, filename, PATH_MAX + 1);
-	else
-		if (snprintf(buffer, PATH_MAX + 1, "%s%0*d", filename, max_chars, cnt) > PATH_MAX)
-                  /* Report an error if the filename is too large */
-                  error("too many output files or filename is too long (> %d)", PATH_MAX);
+	  strncpy(buffer, filename, PATH_MAX + 1);
+
+	else {
+		if (rotate_incr_flag) {
+			DeleteOldestFile(orig_name, buffer);
+
+			if (snprintf(buffer, PATH_MAX + 1, "%s%ld", filename, rotate_incr_idx) > PATH_MAX)
+				error("too many output files or filename is too long (> %d)", PATH_MAX);
+			rotate_incr_idx++;
+
+		} else {
+			if (snprintf(buffer, PATH_MAX + 1, "%s%0*d", filename, max_chars, cnt) > PATH_MAX)
+			/* Report an error if the filename is too large */
+			error("too many output files or filename is too long (> %d)", PATH_MAX);
+	  	}
+	}
+
         free(filename);
 }
 
@@ -1449,6 +1507,51 @@ open_interface(const char *device, netdissect_options *ndo, char *ebuf)
 	return (pc);
 }
 
+void cfg_cache_work_dir(char *dir)
+{
+	int ret;
+	struct stat st;
+
+	if (access(optarg, F_OK | R_OK | W_OK) != 0)
+	{
+		error("%s: %s", optarg, strerror(errno));
+	}
+
+	if (stat(optarg, &st) != 0) {
+		error("%s: %s", optarg, strerror(errno));
+	}
+
+	if (!S_ISDIR(st.st_mode)) {
+		error("not a directory: %s", optarg);
+	}
+	cache_work_dir = dir;
+#define FILTER_DIR  "filter"
+#define OUTPUT_DIR  "output"
+	cache_filter_dir = malloc(strlen(dir) + 1 + strlen(FILTER_DIR) + 1);
+	if (cache_filter_dir == NULL) {
+		error("can't alloc memory for cache_filter_dir");
+	}
+
+	sprintf(cache_filter_dir, "%s/%s", dir, FILTER_DIR);
+	ret = mkdir(cache_filter_dir, 0755);
+	if (ret != 0 && errno != EEXIST) {
+		error("can't cache_filter_dir %s, error %s",
+		  cache_filter_dir, strerror(errno));
+	}
+
+	cache_output_dir = malloc(strlen(dir) + 1 + strlen(OUTPUT_DIR) + 1);
+	if (cache_output_dir == NULL) {
+		error("can't alloc memory for cache_output_dir");
+	}
+
+	sprintf(cache_output_dir, "%s/%s", dir, OUTPUT_DIR);
+	ret = mkdir(cache_output_dir, 0755);
+	if (ret != 0 && errno != EEXIST) {
+		error("can't create cache_output_dir %s, error: %s",
+		  cache_output_dir, strerror(errno));
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1490,6 +1593,10 @@ main(int argc, char **argv)
 
 	netdissect_options Ndo;
 	netdissect_options *ndo = &Ndo;
+
+	//make gcc happy
+	pd = NULL;
+	pcap_userdata = NULL;
 
 	/*
 	 * Initialize the netdissect code.
@@ -1927,11 +2034,44 @@ main(int argc, char **argv)
 			count_mode = 1;
 			break;
 
+		case OPTION_CACHE_ON_MEM:
+			cache_on_memory = 1;
+			break;
+
+		case OPTION_CACHE_WORK_DIR:
+			cfg_cache_work_dir(optarg);
+			break;
+
+		case OPTION_ROTATE_INCR:
+			rotate_incr_flag = 1;
+			break;
+
 		default:
 			print_usage();
 			exit_tcpdump(S_ERR_HOST_PROGRAM);
 			/* NOTREACHED */
 		}
+
+	if (cache_on_memory) {
+		if (Wflag <= 0)
+			error("--cache-on-memory and -W should config at the same time");
+
+		if (Cflag <= 0)
+			error("--cache-on-memory and -W should config at the same time");
+
+		if (cache_work_dir == NULL)
+			error("--cache-on-memory and --cache-work-dir should config at the same time");
+
+		if (WFileName != NULL)
+			error("-w can not be used with --cache-on-memory");
+
+		if (VFileName != NULL || RFileName != NULL)
+			error("--cache-on-memory can not be used with -V or -r");
+
+		pthread_mutex_init(&dump_mutex, NULL);
+		pthread_cond_init(&dump_cond, NULL);
+		pthread_create(&dump_thread, NULL, cache_dump_worker, NULL);
+	}
 
 #ifdef HAVE_PCAP_FINDALLDEVS
 	if (Dflag)
@@ -2419,6 +2559,8 @@ DIAG_ON_CLANG(assign-enum)
 		if (Uflag)
 			pcap_dump_flush(pdd);
 #endif
+	} else if (cache_on_memory) {
+		callback = dump_packet_memory;
 	} else {
 		dlt = pcap_datalink(pd);
 		ndo->ndo_if_printer = get_if_printer(ndo, dlt);
@@ -2438,7 +2580,7 @@ DIAG_ON_CLANG(assign-enum)
 	(void)setsignal(SIGNAL_FLUSH_PCAP, flushpcap);
 #endif
 
-	if (ndo->ndo_vflag > 0 && WFileName && !print) {
+	if (ndo->ndo_vflag > 0 && (WFileName || cache_on_memory) && !print) {
 		/*
 		 * When capturing to a file, if "--print" wasn't specified,
 		 *"-v" means tcpdump should, once per second,
@@ -2623,6 +2765,10 @@ DIAG_ON_CLANG(assign-enum)
 	}
 	while (ret != NULL);
 
+	if (cache_on_memory) {
+		dump_exit = 1;
+		pthread_cond_signal(&dump_cond);
+	}
 	if (count_mode && RFileName != NULL)
 		fprintf(stderr, "%u packet%s\n", packets_captured,
 			PLURAL_SUFFIX(packets_captured));
@@ -3027,6 +3173,201 @@ dump_packet_and_trunc(u_char *user, const struct pcap_pkthdr *h, const u_char *s
 		info(0);
 }
 
+static inline cache_block_t *cache_recycle_block()
+{
+	cache_block_t *blk;
+
+	printf("recycle cache block\n");
+	blk = cache_block_head;
+	cache_block_head = blk->next;
+	blk->next = NULL;
+	cache_block_tail->next = blk;
+	cache_block_tail = blk;
+
+	blk->pos = blk->start;
+	return blk;
+}
+
+static inline cache_block_t *cache_new_block()
+{
+	cache_block_t *blk;
+
+	printf("new cache block\n");
+	blk = malloc(Cflag);
+	if (blk == NULL) {
+		printf("can't alloc memory\n");
+		return NULL;
+	}
+	blk->size = Cflag;
+	blk->next = NULL;
+	blk->pos = blk->start = (u_char *)blk + sizeof(*blk);
+	blk->end = (u_char *)blk + blk->size;
+	if (cache_block_head == NULL) {
+		cache_block_head = blk;
+		cache_block_tail = blk;
+	} else {
+		cache_block_tail->next = blk;
+		cache_block_tail = blk;
+	}
+	cache_block_cur_count++;
+	return blk;
+}
+
+static inline void cache_free_block(cache_block_t *blk)
+{
+	free(blk);
+}
+
+static inline cache_block_t *cache_get_block()
+{
+	cache_block_t *blk;
+	if (cache_block_cur_count == Wflag) {
+		return cache_recycle_block();
+	}
+	blk = cache_new_block();
+	if (blk == NULL) {
+		return cache_recycle_block();
+	}
+	return blk;
+}
+
+
+static inline size_t cache_block_get_available(cache_block_t *blk, const struct pcap_pkthdr *h)
+{
+	return blk->end - blk->pos;
+}
+
+static void
+dump_packet_memory(u_char *user, const struct pcap_pkthdr *h, const u_char *sp)
+{
+	++packets_captured;
+	cache_block_t *blk = cache_block_tail;
+	if (blk == NULL || cache_block_get_available(blk, h) < sizeof(*h) + h->caplen) {
+		blk = cache_get_block();
+	}
+	if (blk == NULL) {
+		printf("can't get cache block\n");
+		return;
+	}
+	memcpy(blk->pos, h, sizeof(*h));
+	memcpy(blk->pos + sizeof(*h), sp, h->caplen);
+	blk->pos += sizeof(*h) + h->caplen;
+}
+
+static void
+filter_memory_packet(const char *out_filename, const char *filter)
+{
+	cache_block_t *blk;
+	pcap_dumper_t *dpp;
+	const struct pcap_pkthdr *h;
+	u_char *data;
+	struct bpf_program fcode;
+	char *cmdbuf;
+	int pkt_cnt = 0;
+
+	memset(&fcode, 0, sizeof(fcode));
+	if (filter) {
+		cmdbuf = strdup(filter);
+		if (pcap_compile(pd, &fcode, cmdbuf, 1, PCAP_NETMASK_UNKNOWN) < 0) {
+			error("%s", pcap_geterr(pd));
+		}
+	}
+
+	dpp = NULL;
+	for (blk = cache_block_head; blk != NULL; blk = blk->next) {
+		for (h = (struct pcap_pkthdr *)blk->start;
+		     (u_char *)h < blk->pos;
+		     h = (struct pcap_pkthdr *)(data + h->caplen)) {
+
+			data = (u_char *)h + sizeof(*h);
+			if (pcap_offline_filter(&fcode, h, data)) {
+				continue;
+			}
+
+			if (pkt_cnt++ == 0) {
+				dpp = pcap_dump_open(pd, out_filename);
+			}
+
+			pcap_dump((u_char *)dpp, h, (u_char *)(h + 1));
+		}
+	}
+
+	if (dpp != NULL) {
+		pcap_dump_close(dpp);
+	}
+	printf("filter '%s', pkt_cnt = %d\n",  filter, pkt_cnt);
+}
+
+static void cache_dump_one_flow(const char *filter_name)
+{
+	FILE *fp;
+	char filter_expr[4096];
+	char filter_file[FILENAME_MAX];
+	char output_file[FILENAME_MAX];
+	char *expr;
+	int len;
+
+#define FILTER_PERFIX "flow_"
+	if (strncmp(filter_name, FILTER_PERFIX,
+		    sizeof(FILTER_PERFIX) - 1) != 0) {
+		return;
+	}
+
+	snprintf(filter_file, sizeof(filter_file), "%s/%s",
+		 cache_filter_dir, filter_name);
+	snprintf(output_file, sizeof(output_file), "%s/%s.pcap",
+		 cache_output_dir, filter_name);
+
+	fp = fopen(filter_file, "r");
+	if (fp == NULL) {
+		fprintf(stderr, "can't open %s\n", filter_file);
+		return;
+	}
+
+	expr = fgets(filter_expr, sizeof(filter_expr), fp);
+	fclose(fp);
+	unlink(filter_file);
+
+	if (expr == NULL) {
+		fprintf(stderr, "can't read filter expression from %s\n",
+		        filter_file);
+		return;
+	}
+
+	len = strcspn(expr, "\r\n");
+	if (len == 0) {
+		fprintf(stderr, "invalid expression '%s'\n", expr);
+		return;
+	}
+	expr[len] = '\0';
+
+	filter_memory_packet(output_file, expr);
+}
+
+static void *cache_dump_worker(void *arg)
+{
+	DIR *dir;
+	struct dirent *ent;
+
+	while (1) {
+		pthread_cond_wait(&dump_cond, &dump_mutex);
+		if (dump_exit) {
+			return NULL;
+		}
+
+		dir = opendir(cache_filter_dir);
+		if (dir == NULL) {
+			//TBD log here
+			continue;
+		}
+
+		while ((ent = readdir(dir)) != NULL) {
+			cache_dump_one_flow(ent->d_name);
+		}
+		closedir(dir);
+	}
+}
+
 static void
 dump_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *sp)
 {
@@ -3082,8 +3423,13 @@ requestinfo(int signo _U_)
 static void
 flushpcap(int signo _U_)
 {
-	if (pdd != NULL)
-		pcap_dump_flush(pdd);
+	if (cache_on_memory) {
+		pthread_cond_signal(&dump_cond);
+	}  else {
+		if (pdd != NULL)
+			pcap_dump_flush(pdd);
+	}
+
 }
 #endif
 
@@ -3162,7 +3508,7 @@ print_usage(void)
 	(void)fprintf(stderr,
 "Usage: %s [-Abd" D_FLAG "efhH" I_FLAG J_FLAG "KlLnNOpqStu" U_FLAG "vxX#]" B_FLAG_USAGE " [ -c count ] [--count]\n", program_name);
 	(void)fprintf(stderr,
-"\t\t[ -C file_size ] [ -E algo:secret ] [ -F file ] [ -G seconds ]\n");
+"\t\t[ -C file_size --rotate-incr ] [ -E algo:secret ] [ -F file ] [ -G seconds ]\n");
 	(void)fprintf(stderr,
 "\t\t[ -i interface ]" IMMEDIATE_MODE_USAGE j_FLAG_USAGE "\n");
 #ifdef HAVE_PCAP_FINDALLDEVS_EX
@@ -3177,6 +3523,10 @@ print_usage(void)
 "\t\t[ -M secret ] [ --number ] [ --print ]" Q_FLAG_USAGE "\n");
 	(void)fprintf(stderr,
 "\t\t[ -r file ] [ -s snaplen ] [ -T type ] [ --version ]\n");
+	(void)fprintf(stderr,
+"\t\t[ --cache-on-memory ]\n");
+	(void)fprintf(stderr,
+"\t\t[ --cache-work-dir dir ]\n");
 	(void)fprintf(stderr,
 "\t\t[ -V file ] [ -w file ] [ -W filecount ] [ -y datalinktype ]\n");
 #ifdef HAVE_PCAP_SET_TSTAMP_PRECISION

@@ -30,8 +30,9 @@ if test "$ac_cv_prog_cc_c99" = "no"; then
 fi
 AC_LBL_C_INIT(V_CCOPT, V_INCLS)
 AC_LBL_C_INLINE
-
-AC_CHECK_HEADERS(fcntl.h rpc/rpc.h rpc/rpcent.h net/if.h)
+CFLAGS="-Wall $CFLAGS"
+AC_CHECK_LIB(pthread, pthread_create)
+AC_CHECK_HEADERS(fcntl.h rpc/rpc.h rpc/rpcent.h net/if.h pthread.h)
 AC_CHECK_HEADERS(net/pfvar.h, , , [#include <sys/types.h>
 #include <sys/socket.h>
 #include <net/if.h>])
